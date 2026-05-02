@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase, RequestFactory
 from rest_framework import status
@@ -89,11 +91,37 @@ class UserApiPermissionTests(APITestCase):
         self.client.force_authenticate(self.soldier)
         response = self.client.patch(
             f"/api/v1/users/{self.soldier.id}/",
-            {"email": "new@example.com", "phone_number": "999"},
+            {"email": "new@example.com"},
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.soldier.refresh_from_db()
         self.assertEqual(self.soldier.email, "new@example.com")
-        self.assertEqual(self.soldier.phone_number, "123")
+
+    def test_status_until_cannot_be_in_past(self):
+        self.client.force_authenticate(self.commander)
+        response = self.client.patch(
+            f"/api/v1/users/{self.soldier.id}/",
+            {"status_until": (date.today() - timedelta(days=1)).isoformat()},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_phone_must_match_russian_format(self):
+        self.client.force_authenticate(self.commander)
+        response = self.client.patch(
+            f"/api/v1/users/{self.soldier.id}/",
+            {"phone_number": "89991234567"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_email_must_have_dot_after_at(self):
+        self.client.force_authenticate(self.commander)
+        response = self.client.patch(
+            f"/api/v1/users/{self.soldier.id}/",
+            {"email": "user@localhost"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 

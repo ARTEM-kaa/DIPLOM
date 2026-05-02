@@ -1,31 +1,54 @@
 from datetime import datetime, timedelta
 
+from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.db.models import Count
+from django.utils import timezone
 from django.utils.dateparse import parse_date
+from drf_spectacular.utils import extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from duties.models import DutyInstance
-from users.permissions import IsCommander, IsAdmin, IsOwnerOrCommander
-from .models import ReplacementRequest, ScheduleRule
+from duties.serializers import DutyInstanceSerializer
+from users.permissions import (
+    IsAdmin,
+    IsCommander,
+    IsCommanderOrAdmin,
+    IsOwnerOrCommander,
+)
+from .models import ReplacementRequest, ScheduleRule, ScheduleTemplate
 from .serializers import (
+    GenerateFromTemplateSerializer,
     ReplacementRequestSerializer,
     ReplacementRequestCreateSerializer,
     ScheduleRuleSerializer,
+    ScheduleTemplateSerializer,
 )
-from .services import is_soldier_available
+from .services import (
+    generate_from_template as generate_from_template_service,
+    is_soldier_available,
+    users_same_platoon,
+)
+
+User = get_user_model()
 
 
 class ReplacementRequestViewSet(viewsets.ModelViewSet):
     """
     Handle replacement requests.
 
+    Replacement target must be a soldier from the same platoon as the requester
+    (platoon rule: admins exempt).
+
     Custom routes:
     - POST /replacements/request/
-    - GET /replacements/pending/
-    - PUT /replacements/{id}/respond/
+    - GET /replacements/pending/ — incoming requests for soldier (replacement)
+    - GET /replacements/pending-commander/ — awaits commander approval
+    - PUT /replacements/{id}/respond/ — soldier approves/rejects (no swap yet)
+    - PUT /replacements/{id}/commander-review/ — commander approves (swap) or rejects
     - PUT /replacements/{id}/cancel/
     """
 
@@ -42,6 +65,22 @@ class ReplacementRequestViewSet(viewsets.ModelViewSet):
             return ReplacementRequestCreateSerializer
         return super().get_serializer_class()
 
+    @extend_schema(exclude=True)
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {
+                "detail": "Use POST /api/v1/replacements/request/ to create a replacement request."
+            },
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    @extend_schema(exclude=True)
+    def partial_update(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "PATCH is not supported for replacement requests."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
     @action(detail=False, methods=["post"], url_path="request")
     def request_replacement(self, request):
         """Create replacement request."""
@@ -55,6 +94,28 @@ class ReplacementRequestViewSet(viewsets.ModelViewSet):
             return Response(
                 {"detail": "Only assigned soldier can request replacement."},
                 status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if getattr(request.user, "role", None) != User.Role.ADMIN:
+            if not users_same_platoon(request.user, requested_replacement):
+                return Response(
+                    {
+                        "detail": (
+                            "Replacement soldier must be from the same platoon as you."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if getattr(requested_replacement, "role", None) != User.Role.SOLDIER:
+            return Response(
+                {
+                    "detail": (
+                        "Replacement must be a soldier; commanders and admins "
+                        "cannot be assigned as replacement."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         # Check availability of requested replacement
@@ -83,11 +144,40 @@ class ReplacementRequestViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(qs, many=True)
         return Response(serializer.data)
 
-    @action(detail=True, methods=["put", "post", "patch"], url_path="respond")
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="pending-commander",
+        permission_classes=[IsAuthenticated, IsCommanderOrAdmin],
+    )
+    def pending_commander(self, request):
+        """Replacement requests waiting for commander after both soldiers agreed."""
+        qs = self.get_queryset().filter(
+            status=ReplacementRequest.Status.PENDING_COMMANDER,
+        )
+        role = getattr(request.user, "role", None)
+        if role != User.Role.ADMIN:
+            # Requests are same-platoon only; commander sees their platoon's queue.
+            platoon = (getattr(request.user, "platoon", "") or "").strip()
+            if not platoon:
+                return Response(
+                    {
+                        "detail": (
+                            "Set platoon on your profile to list pending replacement "
+                            "requests."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            qs = qs.filter(requester__platoon__iexact=platoon)
+        serializer = self.get_serializer(qs, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["put"], url_path="respond")
     def respond(self, request, pk=None):
         """
-        Approve or reject replacement request.
-        Body: { "action": "approve" | "reject" }
+        Requested soldier approves or rejects. Approve moves to commander
+        pending (no roster change yet). Body: { "action": "approve" | "reject" }
         """
         replacement_request = self.get_object()
         action_value = request.data.get("action")
@@ -106,25 +196,105 @@ class ReplacementRequestViewSet(viewsets.ModelViewSet):
             )
 
         if action_value == "approve":
-            replacement_request.status = ReplacementRequest.Status.APPROVED
-            # Swap soldiers in duty instance
-            duty = replacement_request.duty_instance
-            duty.assigned_soldiers.remove(replacement_request.requester)
-            duty.assigned_soldiers.add(replacement_request.requested_replacement)
-            duty.save()
+            replacement_request.status = (
+                ReplacementRequest.Status.PENDING_COMMANDER
+            )
+            replacement_request.soldier_accepted_at = timezone.now()
         elif action_value == "reject":
             replacement_request.status = ReplacementRequest.Status.REJECTED
+            replacement_request.processed_at = timezone.now()
+            replacement_request.processed_by = request.user
         else:
             return Response(
                 {"detail": "Invalid action. Use 'approve' or 'reject'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        from django.utils import timezone
-
-        replacement_request.processed_at = timezone.now()
-        replacement_request.processed_by = request.user
         replacement_request.save()
+        serializer = self.get_serializer(replacement_request)
+        return Response(serializer.data)
+
+    @action(
+        detail=True,
+        methods=["put"],
+        url_path="commander-review",
+        permission_classes=[IsAuthenticated, IsCommanderOrAdmin],
+    )
+    def commander_review(self, request, pk=None):
+        """
+        Commander/admin final approval: swap roster on approve or reject request.
+        Body: { "action": "approve" | "reject" }
+        """
+        replacement_request = self.get_object()
+        if (
+            replacement_request.status
+            != ReplacementRequest.Status.PENDING_COMMANDER
+        ):
+            return Response(
+                {
+                    "detail": "Replacement is not waiting for commander approval."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if getattr(request.user, "role", None) != User.Role.ADMIN:
+            platoon_relevant = (getattr(request.user, "platoon", "") or "").strip()
+            if not platoon_relevant:
+                return Response(
+                    {
+                        "detail": (
+                            "Set platoon on your profile before approving replacements."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            req_p = (replacement_request.requester.platoon or "").strip().lower()
+            pr = platoon_relevant.lower()
+            if req_p != pr:
+                return Response(
+                    {"detail": "Not your platoon's replacement request."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        action_value = request.data.get("action")
+        now = timezone.now()
+        if action_value == "approve":
+            with transaction.atomic():
+                locked = ReplacementRequest.objects.select_for_update().get(
+                    pk=replacement_request.pk
+                )
+                if locked.status != ReplacementRequest.Status.PENDING_COMMANDER:
+                    return Response(
+                        {
+                            "detail": (
+                                "Replacement is not waiting for commander approval."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                locked.status = ReplacementRequest.Status.APPROVED
+                duty = locked.duty_instance
+                duty.assigned_soldiers.remove(locked.requester)
+                duty.assigned_soldiers.add(locked.requested_replacement)
+                duty.save()
+                locked.processed_at = now
+                locked.processed_by = request.user
+                locked.save(
+                    update_fields=["status", "processed_at", "processed_by"]
+                )
+            replacement_request.refresh_from_db()
+        elif action_value == "reject":
+            replacement_request.status = ReplacementRequest.Status.REJECTED
+            replacement_request.processed_at = now
+            replacement_request.processed_by = request.user
+            replacement_request.save(
+                update_fields=["status", "processed_at", "processed_by"]
+            )
+        else:
+            return Response(
+                {"detail": "Invalid action. Use 'approve' or 'reject'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         serializer = self.get_serializer(replacement_request)
         return Response(serializer.data)
 
@@ -137,9 +307,14 @@ class ReplacementRequestViewSet(viewsets.ModelViewSet):
                 {"detail": "Only requester can cancel the request."},
                 status=status.HTTP_403_FORBIDDEN,
             )
-        if replacement_request.status != ReplacementRequest.Status.PENDING:
+        if replacement_request.status not in (
+            ReplacementRequest.Status.PENDING,
+            ReplacementRequest.Status.PENDING_COMMANDER,
+        ):
             return Response(
-                {"detail": "Only pending requests can be cancelled."},
+                {
+                    "detail": "Only open requests can be cancelled (before commander decision)."
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
         replacement_request.status = ReplacementRequest.Status.CANCELLED
@@ -205,6 +380,17 @@ class ScheduleRuleViewSet(viewsets.ModelViewSet):
         return super().partial_update(request, *args, **kwargs)
 
 
+class ScheduleTemplateViewSet(viewsets.ModelViewSet):
+    """CRUD for schedule templates."""
+
+    queryset = ScheduleTemplate.objects.all().order_by("-id")
+    serializer_class = ScheduleTemplateSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        return [IsAuthenticated(), (IsCommander | IsAdmin)()]
+
+
 class ScheduleViewSet(viewsets.ViewSet):
     """
     Read-only schedule views:
@@ -215,6 +401,11 @@ class ScheduleViewSet(viewsets.ViewSet):
     """
 
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        if self.action == "generate_from_template":
+            return [IsAuthenticated(), (IsCommander | IsAdmin)()]
+        return [IsAuthenticated()]
 
     @action(detail=False, methods=["get"], url_path="calendar")
     def calendar(self, request):
@@ -318,4 +509,59 @@ class ScheduleViewSet(viewsets.ViewSet):
             if item["assigned_soldiers"] is not None
         ]
         return Response(result)
+
+    @extend_schema(
+        methods=["POST"],
+        request=GenerateFromTemplateSerializer,
+        responses={201: DutyInstanceSerializer},
+    )
+    @action(detail=False, methods=["post"], url_path="generate-from-template")
+    def generate_from_template(self, request):
+        """
+        Generate duties from schedule template.
+
+        Body: {
+          "start_date": "YYYY-MM-DD",
+          "end_date": "YYYY-MM-DD",
+          "template_id": 1  # optional
+        }
+        """
+        serializer = GenerateFromTemplateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validated = serializer.validated_data
+
+        template_id = validated.get("template_id")
+        if template_id is not None:
+            template = ScheduleTemplate.objects.filter(id=template_id).first()
+            if template is None:
+                return Response(
+                    {"detail": "Template not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+        else:
+            template = ScheduleTemplate.objects.filter(is_default=True).first()
+            if template is None:
+                return Response(
+                    {"detail": "Default template not found."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        try:
+            created_instances = generate_from_template_service(
+                start_date=validated["start_date"],
+                end_date=validated["end_date"],
+                template=template,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        result_serializer = DutyInstanceSerializer(created_instances, many=True)
+        return Response(
+            {
+                "template_id": template.id,
+                "created_count": len(created_instances),
+                "duties": result_serializer.data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 

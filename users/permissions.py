@@ -27,6 +27,18 @@ class IsCommander(BasePermission):
         )
 
 
+class IsCommanderOrAdmin(BasePermission):
+    """Commander or admin (e.g. approve duty replacements)."""
+
+    def has_permission(self, request, view) -> bool:
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return getattr(request.user, "role", None) in (
+            User.Role.COMMANDER,
+            User.Role.ADMIN,
+        )
+
+
 class IsSoldier(BasePermission):
     """Allow access only to soldier users."""
 

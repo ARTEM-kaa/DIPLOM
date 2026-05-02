@@ -10,6 +10,7 @@ class ReplacementRequest(models.Model):
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
+        PENDING_COMMANDER = "pending_commander", "Pending commander approval"
         APPROVED = "approved", "Approved"
         REJECTED = "rejected", "Rejected"
         CANCELLED = "cancelled", "Cancelled"
@@ -36,6 +37,11 @@ class ReplacementRequest(models.Model):
         default=Status.PENDING,
     )
     created_at = models.DateTimeField(default=timezone.now)
+    soldier_accepted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Set when the requested replacement soldier agrees to swap.",
+    )
     processed_at = models.DateTimeField(null=True, blank=True)
     processed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -64,6 +70,28 @@ class ScheduleRule(models.Model):
     )
     value = models.IntegerField()
     is_active = models.BooleanField(default=True)
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.name
+
+
+class ScheduleTemplate(models.Model):
+    """Template that describes duty types for each weekday."""
+
+    name = models.CharField(max_length=100)
+    is_default = models.BooleanField(default=False)
+    rules = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["is_default"],
+                condition=models.Q(is_default=True),
+                name="unique_default_schedule_template",
+            )
+        ]
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.name

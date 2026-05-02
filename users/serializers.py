@@ -1,6 +1,12 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from .validators import (
+    validate_date_not_before_today,
+    validate_email_simple_field,
+    validate_phone_number_field,
+)
+
 User = get_user_model()
 
 
@@ -26,6 +32,15 @@ class UserSerializer(serializers.ModelSerializer):
             "duty_count_this_month",
         ]
         read_only_fields = ["id", "duty_count_this_month", "role"]
+
+    def validate_phone_number(self, value):
+        return validate_phone_number_field(value)
+
+    def validate_email(self, value):
+        return validate_email_simple_field(value)
+
+    def validate_status_until(self, value):
+        return validate_date_not_before_today(value, label="status_until")
 
     def update(self, instance, validated_data):
         """
@@ -55,4 +70,7 @@ class UserStatusSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ["status", "status_until"]
+
+    def validate_status_until(self, value):
+        return validate_date_not_before_today(value, label="status_until")
 

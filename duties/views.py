@@ -99,6 +99,12 @@ class DutyInstanceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        if start_date > end_date:
+            return Response(
+                {"detail": "start_date must be before or equal to end_date."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         duty_types = list(DutyType.objects.filter(id__in=duty_type_ids, is_active=True))
         if not duty_types:
             return Response(
@@ -106,6 +112,12 @@ class DutyInstanceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        result = generate_schedule(start_date, end_date, duty_types)
+        try:
+            result = generate_schedule(start_date, end_date, duty_types)
+        except ValueError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         return Response(result, status=status.HTTP_201_CREATED)
 

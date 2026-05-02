@@ -10,10 +10,19 @@ from django.db.models import Count
 from django.utils import timezone
 
 from duties.models import DutyType, DutyInstance
-from .models import ScheduleRule
+from .models import ScheduleRule, ScheduleTemplate
 
 
 User = get_user_model()
+
+
+def users_same_platoon(a: User, b: User) -> bool:
+    """True if both users belong to the same platoon (case-insensitive, trimmed)."""
+    pa = (getattr(a, "platoon", None) or "").strip().lower()
+    pb = (getattr(b, "platoon", None) or "").strip().lower()
+    if not pa or not pb:
+        return False
+    return pa == pb
 
 
 @dataclass
@@ -141,6 +150,10 @@ def generate_schedule(
     if start_date > end_date:
         raise ValueError("start_date must be before or equal to end_date")
 
+    today = timezone.localdate()
+    if start_date < today or end_date < today:
+        raise ValueError("Schedule period cannot be in the past.")
+
     if soldiers is None:
         soldiers_qs = User.objects.filter(role=User.Role.SOLDIER)
     else:
@@ -220,4 +233,97 @@ def generate_schedule(
         current += timedelta(days=1)
 
     return {"assignments": assignments}
+
+
+def generate_from_template(
+    start_date: date,
+    end_date: date,
+    template: ScheduleTemplate,
+    validate_not_past: bool = True,
+) -> list[DutyInstance]:
+    """
+    Generate duty instances from weekly template rules.
+
+    For each date in range:
+    - resolve weekday (0=Monday ... 6=Sunday)
+    - create DutyInstance per duty_type_id from template.rules[weekday]
+    - if weekday key is missing, skip day
+    """
+    if start_date > end_date:
+        raise ValueError("start_date must be before or equal to end_date")
+
+    today = timezone.localdate()
+    if validate_not_past and (start_date < today or end_date < today):
+        raise ValueError("Schedule period cannot be in the past.")
+
+    current = start_date
+    created_instances: list[DutyInstance] = []
+    rules = ScheduleRule.objects.filter(is_active=True)
+    weekend_rule = rules.filter(
+        rule_type=ScheduleRule.RuleType.WEEKEND_ROTATION
+    ).first()
+    soldiers_qs = User.objects.filter(role=User.Role.SOLDIER)
+
+    while current <= end_date:
+        weekday = str(current.weekday())
+        duty_type_ids = template.rules.get(weekday, [])
+        if not isinstance(duty_type_ids, list):
+            raise ValueError(f"Invalid template.rules format for weekday {weekday}.")
+
+        duty_types_by_id = {
+            duty_type.id: duty_type
+            for duty_type in DutyType.objects.filter(id__in=duty_type_ids, is_active=True)
+        }
+        missing_ids = set(duty_type_ids) - set(duty_types_by_id.keys())
+        if missing_ids:
+            raise ValueError(
+                f"Template references missing or inactive duty types: {sorted(missing_ids)}."
+            )
+
+        for duty_type_id in duty_type_ids:
+            duty_type = duty_types_by_id[duty_type_id]
+            start_time = duty_type.start_time or timezone.now().time()
+            end_time = duty_type.end_time or timezone.now().time()
+            instance = DutyInstance.objects.create(
+                duty_type=duty_type,
+                date=current,
+                start_time=start_time,
+                end_time=end_time,
+                status=DutyInstance.Status.SCHEDULED,
+            )
+
+            # Assign soldiers with the same availability/rule checks as regular generation.
+            required = duty_type.required_soldiers
+            if required > 0:
+                available_candidates = [
+                    s
+                    for s in soldiers_qs
+                    if is_soldier_available(s, current, duty_type=duty_type)
+                ]
+
+                if available_candidates:
+                    is_weekend = current.weekday() >= 5
+
+                    def sort_key(user: User):
+                        base = user.duty_count_this_month
+                        if is_weekend and weekend_rule:
+                            weekend_duties = DutyInstance.objects.filter(
+                                date__week_day__in=[1, 7],
+                                assigned_soldiers=user,
+                            ).count()
+                            return (base, weekend_duties)
+                        return (base,)
+
+                    chosen = sorted(available_candidates, key=sort_key)[:required]
+                    if chosen:
+                        instance.assigned_soldiers.add(*chosen)
+                        for soldier in chosen:
+                            soldier.duty_count_this_month += 1
+                            soldier.save(update_fields=["duty_count_this_month"])
+
+            created_instances.append(instance)
+
+        current += timedelta(days=1)
+
+    return created_instances
 

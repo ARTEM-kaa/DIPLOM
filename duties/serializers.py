@@ -4,6 +4,8 @@ from django.contrib.auth import get_user_model
 from django.db.models import Q
 from rest_framework import serializers
 
+from users.validators import validate_date_not_before_today
+
 from .models import DutyType, DutyInstance
 from schedule.models import ScheduleRule
 
@@ -17,6 +19,21 @@ class DutyTypeSerializer(serializers.ModelSerializer):
     class Meta:
         model = DutyType
         fields = "__all__"
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        inst = self.instance
+        start = attrs["start_time"] if "start_time" in attrs else (
+            inst.start_time if inst else None
+        )
+        end = attrs["end_time"] if "end_time" in attrs else (
+            inst.end_time if inst else None
+        )
+        if start is not None and end is not None and end <= start:
+            raise serializers.ValidationError(
+                {"end_time": "end_time must be after start_time."}
+            )
+        return attrs
 
 
 class DutyInstanceSerializer(serializers.ModelSerializer):
@@ -52,8 +69,23 @@ class DutyInstanceSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "assigned_soldiers"]
 
+    def validate_date(self, value):
+        return validate_date_not_before_today(value, label="Duty date")
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        inst = self.instance
+        start = attrs["start_time"] if "start_time" in attrs else (
+            inst.start_time if inst else None
+        )
+        end = attrs["end_time"] if "end_time" in attrs else (
+            inst.end_time if inst else None
+        )
+        if start is not None and end is not None and end <= start:
+            raise serializers.ValidationError(
+                {"end_time": "end_time must be after start_time."}
+            )
+
         assigned_soldiers = attrs.get("assigned_soldiers")
         if assigned_soldiers is None:
             return attrs
